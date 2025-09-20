@@ -24,21 +24,3 @@
 # udp://@225.1.1.54:5054|mex.hboxtreme.mty|encoder=cpu,audio=1
 #####################################################################################################
 #### 17 CANALES ####
-udp://@225.1.1.125:5125|mex.aztecauno.menos1
-udp://@225.1.1.7:5007|mex.aztecauno.menos2
-udp://@225.1.1.138:5138|mex.discoveryth
-udp://@225.1.1.108:5108|mex.discoveryhh
-udp://@225.1.1.103:5103|mex.discovery
-udp://@225.1.1.219:5219|mex.universal
-udp://@225.1.1.223:5223|mex.history
-udp://@225.1.1.132:5132|mex.space
-udp://@225.1.10.139:15139|mex.universalpremiere
-udp://@225.1.10.140:15140|mex.universalcinema
-udp://@225.1.10.141:15141|mex.universalcomedy
-udp://@225.1.10.142:15142|mex.universalcrime
-udp://@225.1.10.143:15143|mex.universalreality
-udp://@225.1.1.18:5018|mex.babytv
-udp://@225.1.11.233:11233|mex.curiosity|nodeint=1
-udp://@225.1.1.246:5246|mex.teleformula
-udp://@225.1.1.40:5040|gbr.cnn
-udp://@225.1.1.20:5020|esp.a3cine
