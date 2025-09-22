@@ -1,0 +1,122 @@
+####################################################################################################
+# Archivo: parametros.txt
+# Referencia detallada de parámetros personalizados, filtros, mapeos, encoders y hardware soportados
+# por el script canales_udp.sh (chuymex).
+#
+# Cada parámetro puede usarse en el campo de "extra_params" de canales.txt, separados por coma.
+# Ejemplo en canales.txt:
+#   udp://@225.1.1.229:5229 | nombre_canal | encoder=nvenc,audio=auto,bitrate=2M,scale=1280:720
+#
+# Esta guía muestra:
+# - Parámetros personalizados soportados
+# - Opciones de filtros
+# - Opciones de mapeo de audio/video
+# - Encoders y hardware soportado
+# - Ejemplos prácticos de uso por canal
+####################################################################################################
+
+#######################################
+# PARÁMETROS PERSONALIZADOS POR CANAL #
+#######################################
+
+# encoder        : Selecciona el encoder de video. Opciones:
+#                  nvenc (Nvidia GPU), qsv (Intel QuickSync), cuda (Nvidia moderna), cpu (libx264 software)
+#
+# audio          : Controla la selección de audio.
+#                  auto = detecta idioma español en streams, o usa el primero si no existe.
+#                  N    = usa el stream de audio en posición N (empezando en 1).
+#
+# map            : Permite mapeo manual de streams (ejemplo: "-map 0:v -map 0:a:1").
+#
+# bitrate        : Bitrate de video. Ejemplo: "2M", "3500k", "800k".
+#
+# scale          : Resolución de salida. Formato: "anchura:altura". Ejemplo: "1280:720", "1920:1080".
+#
+# nodeint        : Deshabilita desentrelazado. "1" = no aplicar yadif/deinterlacing, "0" = aplicar.
+#
+# deint          : En pipeline cuvid, "1" deshabilita el filtro de desentrelazado (-deint 1).
+#
+# screen         : "1" activa crop tipo cinema especial (recorte + escalado fijo a 1280:720).
+#
+# Ejemplo de línea completa en canales.txt:
+# udp://@225.1.1.229:5229 | canal_ejemplo | encoder=nvenc,audio=auto,bitrate=2M,scale=1280:720,nodeint=0,deint=0,screen=1
+
+########################
+# FILTROS DE VIDEO     #
+########################
+
+# El script aplica filtros según encoder y parámetros:
+#
+# - Para encoder=nvenc con cuvid: resize se hace en el decoder, NO se agrega -vf scale.
+# - Para encoder=cpu: se usan filtros software, ejemplo "-vf yadif,scale=1280:720".
+# - Para encoder=qsv: usa scale_qsv si soportado, yadif/deinterlace_qsv para desentrelazado.
+# - Para encoder=cuda: usa yadif_cuda,scale_cuda.
+# - Si "screen=1": filtro especial para crop tipo cinema: crop=w=ih*16/9:h=ih,scale=1280:720
+#
+# Ejemplo:
+#   encoder=cpu,nodeint=0,scale=1920:1080,screen=1
+
+########################
+# MAPEO DE AUDIO/VIDEO #
+########################
+
+# Mapeo manual:
+#   map=-map 0:v -map 0:a:1
+# Mapeo automático:
+#   audio=auto   (selecciona stream en español si lo detecta; si no, el primero)
+# Mapeo por índice:
+#   audio=2      (selecciona el segundo stream de audio)
+#
+# Ejemplo práctico:
+#   encoder=nvenc,audio=auto
+#   encoder=nvenc,map="-map 0:v -map 0:a:2"
+
+#####################
+# ENCODERS SOPORTADOS
+#####################
+
+# nvenc  : Nvidia GPU, usa cuvid para decodificación, escala en hardware.
+# qsv    : Intel QuickSync Video, decodificación y escalado en hardware Intel.
+# cuda   : Nvidia moderna, pipeline con yadif_cuda, scale_cuda.
+# cpu    : Software (libx264), pipeline clásica.
+
+# Ejemplo:
+#   encoder=nvenc,bitrate=2M
+#   encoder=qsv,bitrate=3M,scale=1920:1080
+#   encoder=cuda,bitrate=4M,scale=1280:720
+#   encoder=cpu,bitrate=2M,scale=1280:720
+
+#########################
+# HARDWARE SOPORTADO    #
+#########################
+
+# Nvidia GPU  : Requiere soporte NVENC y CUVID (driver y ffmpeg compilado adecuado)
+# Intel GPU   : Requiere QuickSync, ffmpeg compilado con QSV
+# CPU         : Cualquier sistema con ffmpeg y libx264
+# CUDA        : Tarjetas Nvidia recientes, ffmpeg con soporte scale_cuda/yadif_cuda
+
+###########################################################
+# EJEMPLOS PRÁCTICOS DE USO EN canales.txt
+###########################################################
+
+# 1. Canal con decoder cuvid, encoder nvenc, audio español auto, escala 1280:720
+udp://@225.1.1.229:5229 | mex.forotv | encoder=nvenc,audio=auto,scale=1280:720
+
+# 2. Canal con decoder cuvid, encoder nvenc, crop cinema y desentrelazado deshabilitado
+udp://@225.1.1.229:5229 | mex.cinema | encoder=nvenc,screen=1,nodeint=1,deint=1,scale=1280:720
+
+# 3. Canal con encoder CPU, bitrate y resolución personalizada
+udp://@225.1.1.229:5229 | test.cpu | encoder=cpu,bitrate=3M,scale=1920:1080
+
+# 4. Canal con encoder Intel QSV y audio manual (stream 2)
+udp://@225.1.1.229:5229 | test.qsv | encoder=qsv,audio=2,scale=1280:720
+
+# 5. Canal con encoder CUDA y audio español auto
+udp://@225.1.1.229:5229 | test.cuda | encoder=cuda,audio=auto,scale=1920:1080
+
+# 6. Canal con mapeo manual
+udp://@225.1.1.229:5229 | test.map | encoder=nvenc,map="-map 0:v -map 0:a:2",scale=1280:720
+
+####################################################################################################
+# FIN DEL ARCHIVO DE REFERENCIA DE PARÁMETROS
+####################################################################################################
