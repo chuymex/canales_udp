@@ -4,12 +4,6 @@
 # Script: canales_udp.sh
 # Supervisión y relanzamiento automático/manual de canales UDP con FFmpeg.
 # Modular, altamente comentado, soporta Intel+Nvidia/QSV/CPU, mapeo de audio robusto, logging.
-# Incluye:
-#  - screen=1: crop tipo cinema.
-#  - encoder=cpu: utiliza preset CPU con desentrelazado y escalado a 1280x720 y bitrate 2M.
-#  - encoder=qsv: decodificación y codificación QSV, escalado, desentrelazado.
-#  - nodeint=0/1: habilita/deshabilita desentrelazado.
-#  - supervisor que relanza canales caídos y pausa individualmente si excede fallas.
 # Autor: chuymex
 #
 # Uso en canales.txt:
@@ -27,15 +21,15 @@ CUSTOM_PARAMS_DEFAULT[nodeint]="0"        # 1 = sin desentrelazado, 0 = con dese
 CUSTOM_PARAMS_DEFAULT[encoder]="nvenc"    # nvenc (Nvidia), qsv (Intel), cpu, cuda
 CUSTOM_PARAMS_DEFAULT[map]=""             # Mapeo manual de streams en ffmpeg
 CUSTOM_PARAMS_DEFAULT[audio]="auto"       # auto = detecta español, o index
-CUSTOM_PARAMS_DEFAULT[bitrate]="2M"       # Bitrate de video (solo para CPU encoder, ahora fijo)
+CUSTOM_PARAMS_DEFAULT[bitrate]="2M"       # Bitrate de video
 CUSTOM_PARAMS_DEFAULT[scale]="1280:720"   # Resolución de salida
 CUSTOM_PARAMS_DEFAULT[screen]="0"         # 1 = crop tipo cinema especial
 
 # --- Parámetros globales de control ---
-MAX_FAILS=5         # Número máximo de reinicios permitidos en la ventana temporal por canal
-FAIL_WINDOW=600     # Ventana de tiempo en segundos para conteo de fallas por canal
-MAX_LOG_LINES=2000  # Máximo de líneas en log antes de recorte
-MAX_LOG_SIZE=81920  # Máximo de tamaño en bytes de log antes de recorte
+MAX_FAILS=5         # Máximo de reinicios permitidos
+FAIL_WINDOW=600     # Ventana de tiempo en segundos para fallas
+MAX_LOG_LINES=2000  # Máximo de líneas en log
+MAX_LOG_SIZE=81920  # Máximo de tamaño en bytes de log
 
 # --- Presets de FFmpeg por encoder ---
 declare -A ENCODER_PRESETS
@@ -54,19 +48,18 @@ NC='\033[0m'
 # =====================================================================
 # [2] CONFIGURACIÓN GENERAL Y RUTAS
 # =====================================================================
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"      # Directorio donde está el script
-LOG_DIR="$SCRIPT_DIR/logs"                       # Carpeta de logs por canal
-CANALES_FILE="$SCRIPT_DIR/canales.txt"           # Archivo de canales y parámetros
-RTMP_PREFIX="rtmp://fuentes.futuretv.pro:9922/tp" # Prefijo de salida RTMP
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+CANALES_FILE="$SCRIPT_DIR/canales.txt"
+RTMP_PREFIX="rtmp://fuentes.futuretv.pro:9922/tp"
 
 # =====================================================================
 # [3] LOGGING Y INICIALIZACIÓN
 # =====================================================================
-# Inicializa logs y elimina logs antiguos, prepara historial de fallos
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Inicializando logs y eliminando antiguos..."
 mkdir -p "$LOG_DIR"
 find "$LOG_DIR" -type f -name "*.log" -delete
-declare -A FAIL_HISTORY # Historial de timestamps de caídas por canal
+declare -A FAIL_HISTORY
 
 # =====================================================================
 # [4] FUNCIONES MODULARES Y UTILITARIAS
@@ -89,7 +82,7 @@ limitar_log() {
     fi
 }
 
-# --- Detecta el índice de stream de audio en español (spa) en el contenedor, retorna posición
+# --- Detecta el índice de stream de audio en español (spa) en el contenedor, retorna posición relativa
 detectar_audio_spa_relativo() {
     local udp_url="$1"
     local log_file="$2"
@@ -172,9 +165,9 @@ ajustar_url_udp() {
     echo "$url"
 }
 
-# --- Construye la pipeline FFmpeg según el encoder y parámetros
-#     CPU siempre usa -vf yadif,scale=1280:720 y bitrate 2M
-#     QSV fuerza decodificador QSV si posible, crop/cinema, desentrelazado QSV/yadif
+# --- Construye pipeline FFmpeg ADAPTATIVA: 
+#     - Si es h264 y NVENC, usa filtros GPU (yadif_cuda, scale_cuda)
+#     - Si es mpeg2 u otro, usa filtros normales
 construir_pipeline_ffmpeg() {
     local udp_url="$1"
     local encoder="$2"
@@ -184,89 +177,103 @@ construir_pipeline_ffmpeg() {
     local bitrate="$6"
     local video_codec; video_codec=$(detectar_codec_video "$udp_url")
 
-    local ffmpeg_common="" filtro_opt="" encode_common=""
     local resize; resize=$(echo "$scale" | sed 's/:/x/')
     local filtro_screen=""
     if [[ "$screen" == "1" ]]; then
         filtro_screen='crop=w=ih*16/9:h=ih,scale=1280:720'
     fi
 
+    FF_PREINPUT=""
+    FF_FILTER=""
+    FF_ENCODE=""
+
+    # --- CPU encoder (siempre filtros normales) ---
     if [[ "$encoder" == "cpu" ]]; then
-        ffmpeg_common="-y"
-        filtro_opt="-vf yadif,scale=1280:720"
-        encode_common="${ENCODER_PRESETS[cpu]}"
+        FF_PREINPUT="-y"
+        FF_FILTER="-vf yadif,scale=${scale}"
+        FF_ENCODE="${ENCODER_PRESETS[cpu]}"
+
+    # --- QSV encoder (Intel) ---
     elif [[ "$encoder" == "qsv" ]]; then
-        # QSV: decodificador y codificador QSV si posible
         if [[ "$video_codec" == "mpeg2video" ]]; then
-            ffmpeg_common="-y -hwaccel qsv -c:v mpeg2_qsv"
+            FF_PREINPUT="-y -hwaccel qsv -c:v mpeg2_qsv"
         else
-            ffmpeg_common="-y -hwaccel qsv -c:v ${video_codec}_qsv"
+            FF_PREINPUT="-y -hwaccel qsv -c:v ${video_codec}_qsv"
         fi
-        # Crop/cinema
         if [[ -n "$filtro_screen" ]]; then
-            filtro_opt="-vf $filtro_screen"
+            FF_FILTER="-vf $filtro_screen"
         else
-            # Desentrelazado QSV si nodeint=0, YADIF si no soporta filtro QSV
             if [[ "$nodeint" == "1" ]]; then
                 if detectar_soporte_scale_qsv; then
-                    filtro_opt="-vf scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+                    FF_FILTER="-vf scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
                 else
-                    filtro_opt="-vf scale=${scale}"
+                    FF_FILTER="-vf scale=${scale}"
                 fi
             else
                 if ffmpeg -hide_banner -filters 2>&1 | grep -q 'deinterlace_qsv'; then
-                    filtro_opt="-vf deinterlace_qsv,scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+                    FF_FILTER="-vf deinterlace_qsv,scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
                 elif detectar_soporte_scale_qsv; then
-                    filtro_opt="-vf yadif,scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+                    FF_FILTER="-vf yadif,scale_qsv=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
                 else
-                    filtro_opt="-vf yadif,scale=${scale}"
+                    FF_FILTER="-vf yadif,scale=${scale}"
                 fi
             fi
         fi
-        encode_common="${ENCODER_PRESETS[qsv]}"
+        FF_ENCODE="${ENCODER_PRESETS[qsv]}"
+
+    # --- CUDA encoder (usa filtros GPU) ---
     elif [[ "$encoder" == "cuda" ]]; then
-        ffmpeg_common="-y -hwaccel cuda -hwaccel_output_format cuda"
-        filtro_opt="-vf yadif_cuda"
-        encode_common="${ENCODER_PRESETS[cuda]}"
+        FF_PREINPUT="-y -hwaccel cuda -hwaccel_output_format cuda"
+        FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+        FF_ENCODE="${ENCODER_PRESETS[cuda]}"
+
+    # --- NVENC encoder (Nvidia) ---
     elif [[ "$encoder" == "nvenc" ]]; then
-        if [[ "$video_codec" == "mpeg2video" ]]; then
-            if [[ "$nodeint" == "1" ]]; then
-                if [[ -n "$filtro_screen" ]]; then
-                    filtro_opt="-vf $filtro_screen"
-                else
-                    filtro_opt="-vf scale=${scale}"
-                fi
-                ffmpeg_common="-y -c:v mpeg2video $filtro_opt"
-            else
-                if [[ -n "$filtro_screen" ]]; then
-                    filtro_opt="-vf $filtro_screen"
-                else
-                    filtro_opt="-vf yadif,scale=${scale}"
-                fi
-                ffmpeg_common="-y -c:v mpeg2video $filtro_opt"
-            fi
-        else
+        # Si es h264, usamos decodificación por GPU y filtros GPU
+        if [[ "$video_codec" == "h264" ]]; then
+            FF_PREINPUT="-y -hwaccel cuvid -c:v h264_cuvid"
             if [[ -n "$filtro_screen" ]]; then
-                filtro_opt="-vf $filtro_screen"
-                ffmpeg_common="-y -hwaccel cuvid -hwaccel_output_format cuda -c:v ${video_codec}_cuvid $filtro_opt"
+                FF_FILTER="-vf $filtro_screen"
+            else
+                if [[ "$nodeint" == "0" ]]; then
+                    FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+                else
+                    FF_FILTER="-vf scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+                fi
+            fi
+        # Si es MPEG2 o cualquier otro, decodifica por CPU y usa filtros normales
+        elif [[ "$video_codec" == "mpeg2video" ]]; then
+            FF_PREINPUT="-y -c:v mpeg2video"
+            if [[ -n "$filtro_screen" ]]; then
+                FF_FILTER="-vf $filtro_screen"
             else
                 if [[ "$nodeint" == "1" ]]; then
-                    ffmpeg_common="-y -hwaccel cuvid -hwaccel_output_format cuda -c:v ${video_codec}_cuvid -resize ${resize}"
+                    FF_FILTER="-vf scale=${scale}"
                 else
-                    ffmpeg_common="-y -hwaccel cuvid -hwaccel_output_format cuda -c:v ${video_codec}_cuvid -deint 1 -drop_second_field 1 -resize ${resize}"
+                    FF_FILTER="-vf yadif,scale=${scale}"
+                fi
+            fi
+        else
+            # Para otros codecs, decodifica por CPU y usa filtros normales
+            FF_PREINPUT="-y"
+            if [[ -n "$filtro_screen" ]]; then
+                FF_FILTER="-vf $filtro_screen"
+            else
+                if [[ "$nodeint" == "1" ]]; then
+                    FF_FILTER="-vf scale=${scale}"
+                else
+                    FF_FILTER="-vf yadif,scale=${scale}"
                 fi
             fi
         fi
-        encode_common="${ENCODER_PRESETS[nvenc]}"
-    else
-        ffmpeg_common="-y -hwaccel cuvid -c:v ${video_codec}_cuvid -resize ${resize}"
-        filtro_opt=""
-        encode_common="${ENCODER_PRESETS[nvenc]}"
-    fi
+        FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
 
-    export FF_COMMON="$ffmpeg_common"
-    export FF_FILTER="$filtro_opt"
-    export FF_ENCODE="$encode_common"
+    # --- Default: decodifica por CPU y usa filtros normales ---
+    else
+        FF_PREINPUT="-y"
+        FF_FILTER="-vf scale=${scale}"
+        FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
+    fi
 }
 
 # --- Determina el mapeo de audio (manual o auto), retorna opción para ffmpeg
@@ -313,11 +320,10 @@ lanzar_canal() {
     map_opt="$(determinar_mapeo_audio "$udp_url" "$log_file" "$audio" "$map" | tail -n 1)"
     limitar_log "$log_file"
 
-    local ffmpeg_cmd="ffmpeg $FF_COMMON -i $udp_url $FF_FILTER $FF_ENCODE $map_opt $rtmp_url"
+    local ffmpeg_cmd="ffmpeg $FF_PREINPUT -i $udp_url $FF_FILTER $FF_ENCODE $map_opt $rtmp_url"
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Comando FFmpeg generado: $ffmpeg_cmd" | tee -a "$log_file"
     limitar_log "$log_file"
 
-    # Mata procesos ffmpeg duplicados por canal
     local pids
     pids=$(ps -eo pid,args | grep "[f]fmpeg" | awk -v url="$rtmp_url" '
     {
@@ -334,14 +340,12 @@ lanzar_canal() {
         sleep 1
     fi
 
-    # Diagnóstico previo UDP con ffprobe
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Diagnóstico previo UDP con ffprobe..." >> "$log_file"
     limitar_log "$log_file"
     timeout 8 ffprobe "$udp_url" >> "$log_file" 2>&1 || \
         echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] ffprobe no pudo acceder a fuente UDP." >> "$log_file"
     limitar_log "$log_file"
 
-    # Estado RAM/disco/GPU
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Estado RAM/disco/GPU:" >> "$log_file"
     limitar_log "$log_file"
     free -h >> "$log_file"
@@ -351,7 +355,6 @@ lanzar_canal() {
     command -v nvidia-smi &>/dev/null && nvidia-smi >> "$log_file"
     limitar_log "$log_file"
 
-    # Lanzar ffmpeg en segundo plano para canal
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Lanzando ffmpeg en segundo plano para $canal_nombre" >> "$log_file"
     limitar_log "$log_file"
     nohup $ffmpeg_cmd >> "$log_file" 2>&1 &
@@ -387,12 +390,8 @@ lanzar_todos_canales() {
 # =====================================================================
 # [7] SUPERVISIÓN Y RELANZAMIENTO AUTOMÁTICO DE CANALES (PAUSA INDIVIDUAL)
 # =====================================================================
-# El supervisor revisa cada canal:
-# - Si el proceso ffmpeg no existe para ese canal, lo relanza.
-# - Si el canal excede el número de caídas en ventana, lo pausa 10 minutos.
-# - La pausa es por canal, no global, otros canales siguen supervisados.
 supervisar_canales() {
-    declare -A PAUSA_CANAL # Mapa canal -> timestamp (hasta cuándo está pausado)
+    declare -A PAUSA_CANAL
     while true; do
         now=$(date +%s)
         for entry in "${canales[@]}"; do
@@ -400,14 +399,12 @@ supervisar_canales() {
             rtmp_url="$RTMP_PREFIX/$canal_nombre"
             log_file="$LOG_DIR/$canal_nombre.log"
 
-            # Si el canal está en pausa, lo saltamos hasta que termine la pausa
             if [[ -n "${PAUSA_CANAL["$canal_nombre"]}" ]] && (( now < PAUSA_CANAL["$canal_nombre"] )); then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Supervisor: el canal $canal_nombre está en pausa hasta $(date -d @${PAUSA_CANAL["$canal_nombre"]})" >> "$log_file"
                 limitar_log "$log_file"
                 continue
             fi
 
-            # Detectar proceso ffmpeg activo para el canal
             local pids
             pids=$(ps -eo pid,args | grep "[f]fmpeg" | awk -v url="$rtmp_url" '
             {
@@ -424,7 +421,7 @@ supervisar_canales() {
                 if (( fails > MAX_FAILS )); then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Canal $canal_nombre cayó $fails veces en los últimos $FAIL_WINDOW segundos. Pausando relanzamiento por 10 minutos." >> "$log_file"
                     limitar_log "$log_file"
-                    PAUSA_CANAL["$canal_nombre"]=$((now+600))  # Pausa solo este canal
+                    PAUSA_CANAL["$canal_nombre"]=$((now+600))
                     continue
                 fi
 
