@@ -24,6 +24,7 @@ CUSTOM_PARAMS_DEFAULT[audio]="auto"       # auto = detecta español, o index
 CUSTOM_PARAMS_DEFAULT[bitrate]="2M"       # Bitrate de video
 CUSTOM_PARAMS_DEFAULT[scale]="1280:720"   # Resolución de salida
 CUSTOM_PARAMS_DEFAULT[screen]="0"         # 1 = crop tipo cinema especial
+CUSTOM_PARAMS_DEFAULT[deint]="0"          # 1 = deshabilita flags de desentrelazado cuvid (deint y drop_second_field)
 
 # --- Parámetros globales de control ---
 MAX_FAILS=5         # Máximo de reinicios permitidos
@@ -142,6 +143,7 @@ parsear_parametros_personalizados() {
                 bitrate=*) params[bitrate]="${kv#bitrate=}" ;;
                 scale=*)   params[scale]="${kv#scale=}" ;;
                 screen=*)  params[screen]="${kv#screen=}" ;;
+                deint=*)   params[deint]="${kv#deint=}" ;;
             esac
         done
     fi
@@ -166,8 +168,9 @@ ajustar_url_udp() {
 }
 
 # --- Construye pipeline FFmpeg ADAPTATIVA: 
-#     - Si es h264 y NVENC, usa filtros GPU (yadif_cuda, scale_cuda)
-#     - Si es mpeg2 u otro, usa filtros normales
+#     - Por defecto usa cuvid para nvenc con flags de desentrelazado
+#     - Si encoder=cuda mantiene pipeline CUDA actual (yadif_cuda + scale_cuda)  
+#     - Si deint=1 deshabilita flags de desentrelazado cuvid
 construir_pipeline_ffmpeg() {
     local udp_url="$1"
     local encoder="$2"
@@ -175,6 +178,7 @@ construir_pipeline_ffmpeg() {
     local scale="$4"
     local screen="$5"
     local bitrate="$6"
+    local deint="$7"
     local video_codec; video_codec=$(detectar_codec_video "$udp_url")
 
     local resize; resize=$(echo "$scale" | sed 's/:/x/')
@@ -227,34 +231,16 @@ construir_pipeline_ffmpeg() {
         FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
         FF_ENCODE="${ENCODER_PRESETS[cuda]}"
 
-    # --- NVENC encoder (Nvidia) ---
+    # --- NVENC encoder (Nvidia) - Pipeline cuvid por defecto ---
     elif [[ "$encoder" == "nvenc" ]]; then
-        # Si es h264, usamos decodificación por GPU y filtros GPU
+        # Determinar codec para cuvid (h264_cuvid o mpeg2_cuvid)
+        local cuvid_codec=""
         if [[ "$video_codec" == "h264" ]]; then
-            FF_PREINPUT="-y -hwaccel cuvid -c:v h264_cuvid"
-            if [[ -n "$filtro_screen" ]]; then
-                FF_FILTER="-vf $filtro_screen"
-            else
-                if [[ "$nodeint" == "0" ]]; then
-                    FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
-                else
-                    FF_FILTER="-vf scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
-                fi
-            fi
-        # Si es MPEG2 o cualquier otro, decodifica por CPU y usa filtros normales
+            cuvid_codec="h264_cuvid"
         elif [[ "$video_codec" == "mpeg2video" ]]; then
-            FF_PREINPUT="-y -c:v mpeg2video"
-            if [[ -n "$filtro_screen" ]]; then
-                FF_FILTER="-vf $filtro_screen"
-            else
-                if [[ "$nodeint" == "1" ]]; then
-                    FF_FILTER="-vf scale=${scale}"
-                else
-                    FF_FILTER="-vf yadif,scale=${scale}"
-                fi
-            fi
+            cuvid_codec="mpeg2_cuvid"
         else
-            # Para otros codecs, decodifica por CPU y usa filtros normales
+            # Para otros codecs, fallback a CPU
             FF_PREINPUT="-y"
             if [[ -n "$filtro_screen" ]]; then
                 FF_FILTER="-vf $filtro_screen"
@@ -265,7 +251,28 @@ construir_pipeline_ffmpeg() {
                     FF_FILTER="-vf yadif,scale=${scale}"
                 fi
             fi
+            FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
+            return
         fi
+
+        # Construir pipeline cuvid
+        local resize; resize=$(echo "$scale" | sed 's/:/x/')
+        local cuvid_flags=""
+        
+        # Agregar flags de desentrelazado solo si deint!=1
+        if [[ "$deint" != "1" ]]; then
+            cuvid_flags=" -deint 1 -drop_second_field 1"
+        fi
+        
+        FF_PREINPUT="-y -vsync 0 -hwaccel cuvid -c:v $cuvid_codec$cuvid_flags -resize $resize"
+        
+        # Para nvenc con cuvid, no usamos filtros de video adicionales a menos que sea screen crop
+        if [[ -n "$filtro_screen" ]]; then
+            FF_FILTER="-vf $filtro_screen"
+        else
+            FF_FILTER=""
+        fi
+        
         FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
 
     # --- Default: decodifica por CPU y usa filtros normales ---
@@ -311,10 +318,10 @@ lanzar_canal() {
     udp_url=$(ajustar_url_udp "$udp_url")
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Lanzando canal: $canal_nombre" | tee -a "$log_file"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Parámetros personalizados: nodeint=$nodeint, encoder=$encoder, map='$map', audio=$audio, bitrate=$bitrate, scale=$scale, screen=$screen" | tee -a "$log_file"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Parámetros personalizados: nodeint=$nodeint, encoder=$encoder, map='$map', audio=$audio, bitrate=$bitrate, scale=$scale, screen=$screen, deint=$deint" | tee -a "$log_file"
     limitar_log "$log_file"
 
-    construir_pipeline_ffmpeg "$udp_url" "$encoder" "$nodeint" "$scale" "$screen" "$bitrate"
+    construir_pipeline_ffmpeg "$udp_url" "$encoder" "$nodeint" "$scale" "$screen" "$bitrate" "$deint"
 
     local map_opt
     map_opt="$(determinar_mapeo_audio "$udp_url" "$log_file" "$audio" "$map" | tail -n 1)"
