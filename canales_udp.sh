@@ -3,7 +3,7 @@
 ####################################################################################################
 # Script: canales_udp.sh
 # Supervisión y relanzamiento automático/manual de canales UDP con FFmpeg.
-# Modular, altamente comentado, soporta Intel+Nvidia/QSV/CPU, mapeo de audio robusto, logging.
+# Modular, altamente comentado, soporta Intel+Nvidia/QSV/CUDA/CPU, mapeo de audio robusto, logging.
 # Autor: chuymex
 #
 # Uso en canales.txt:
@@ -15,7 +15,6 @@
 # [1] PARÁMETROS PERSONALIZABLES Y PRESETS DE ENCODERS
 # =====================================================================
 
-# --- Parámetros por canal, sobreescribibles en canales.txt ---
 declare -A CUSTOM_PARAMS_DEFAULT
 CUSTOM_PARAMS_DEFAULT[nodeint]="0"        # 1 = sin desentrelazado, 0 = con desentrelazado (yadif/deinterlace_qsv)
 CUSTOM_PARAMS_DEFAULT[encoder]="nvenc"    # nvenc (Nvidia), qsv (Intel), cpu, cuda
@@ -24,21 +23,19 @@ CUSTOM_PARAMS_DEFAULT[audio]="auto"       # auto = detecta español, o index
 CUSTOM_PARAMS_DEFAULT[bitrate]="2M"       # Bitrate de video
 CUSTOM_PARAMS_DEFAULT[scale]="1280:720"   # Resolución de salida
 CUSTOM_PARAMS_DEFAULT[screen]="0"         # 1 = crop tipo cinema especial
+CUSTOM_PARAMS_DEFAULT[deint]="0"          # 1 = deshabilita deinterlace en cuvid (nuevo parámetro)
 
-# --- Parámetros globales de control ---
 MAX_FAILS=5         # Máximo de reinicios permitidos
 FAIL_WINDOW=600     # Ventana de tiempo en segundos para fallas
 MAX_LOG_LINES=2000  # Máximo de líneas en log
 MAX_LOG_SIZE=81920  # Máximo de tamaño en bytes de log
 
-# --- Presets de FFmpeg por encoder ---
 declare -A ENCODER_PRESETS
 ENCODER_PRESETS[nvenc]="-c:v h264_nvenc -b:v 2M -bufsize 4M -preset p2 -tune 3 -g 60 -c:a aac -dts_delta_threshold 1000 -ab 128k -ar 44100 -ac 1 -f flv"
 ENCODER_PRESETS[qsv]="-c:v h264_qsv -b:v 2M -preset veryfast -c:a aac -ab 128k -ar 44100 -ac 1 -f flv"
 ENCODER_PRESETS[cuda]="-c:v h264_nvenc -preset 2 -tune 3 -keyint_min 30 -b:v 2048k -bt 1 -maxrate 2048k -bufsize 4096k -c:a aac -ar 44100 -ac 1 -ab 192k -f flv"
 ENCODER_PRESETS[cpu]="-c:v libx264 -b:v 2M -preset veryfast -c:a aac -ab 128k -ar 44100 -ac 1 -f flv"
 
-# --- Colores para consola ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -65,7 +62,7 @@ declare -A FAIL_HISTORY
 # [4] FUNCIONES MODULARES Y UTILITARIAS
 # =====================================================================
 
-# --- Limita tamaño y líneas de logs para evitar archivos gigantes
+# Limita tamaño y líneas de logs para evitar archivos gigantes
 limitar_log() {
     local log_file="$1"
     if [[ -f "$log_file" ]]; then
@@ -82,7 +79,7 @@ limitar_log() {
     fi
 }
 
-# --- Detecta el índice de stream de audio en español (spa) en el contenedor, retorna posición relativa
+# Detecta el índice de stream de audio en español (spa) en el contenedor, retorna posición relativa
 detectar_audio_spa_relativo() {
     local udp_url="$1"
     local log_file="$2"
@@ -111,19 +108,19 @@ detectar_audio_spa_relativo() {
     '
 }
 
-# --- Detecta el codec de video para decidir pipeline óptima
+# Detecta el codec de video para decidir pipeline óptima (h264, mpeg2video, etc)
 detectar_codec_video() {
     local udp_url="$1"
     ffprobe -v error -show_streams -select_streams v "$udp_url" 2>/dev/null | awk -F= '/^codec_name=/{print $2; exit}'
 }
 
-# --- Detecta si ffmpeg soporta filtro scale_qsv (Intel QuickSync)
+# Detecta si ffmpeg soporta filtro scale_qsv (Intel QuickSync)
 detectar_soporte_scale_qsv() {
     ffmpeg -hide_banner -filters 2>&1 | grep -q 'scale_qsv'
     return $?
 }
 
-# --- Parsea parámetros personalizados por canal, los exporta como variables locales
+# Parsea parámetros personalizados por canal, los exporta como variables locales
 parsear_parametros_personalizados() {
     local extra_params="$1"
     declare -A params
@@ -142,6 +139,7 @@ parsear_parametros_personalizados() {
                 bitrate=*) params[bitrate]="${kv#bitrate=}" ;;
                 scale=*)   params[scale]="${kv#scale=}" ;;
                 screen=*)  params[screen]="${kv#screen=}" ;;
+                deint=*)   params[deint]="${kv#deint=}" ;;
             esac
         done
     fi
@@ -150,7 +148,7 @@ parsear_parametros_personalizados() {
     done
 }
 
-# --- Agrega fifo_size/overrun_nonfatal si falta en URL UDP para evitar overrun de buffer en ffmpeg
+# Agrega fifo_size/overrun_nonfatal si falta en URL UDP para evitar overrun de buffer en ffmpeg
 ajustar_url_udp() {
     local url="$1"
     if [[ "$url" =~ ^udp:// ]]; then
@@ -165,9 +163,12 @@ ajustar_url_udp() {
     echo "$url"
 }
 
-# --- Construye pipeline FFmpeg ADAPTATIVA: 
-#     - Si es h264 y NVENC, usa filtros GPU (yadif_cuda, scale_cuda)
-#     - Si es mpeg2 u otro, usa filtros normales
+# =====================================================================
+# [5] PIPELINE FFmpeg ADAPTATIVA (CORRECTA PARA CUVID + RESIZE)
+# =====================================================================
+# La pipeline cuvid hace resize en el decoder, así que NO se debe agregar un filtro de escala.
+# Si el encoder es nvenc y el decoder cuvid, solo usaremos resize en el PREINPUT.
+# Para otros encoders, sí se usa -vf scale.
 construir_pipeline_ffmpeg() {
     local udp_url="$1"
     local encoder="$2"
@@ -175,10 +176,11 @@ construir_pipeline_ffmpeg() {
     local scale="$4"
     local screen="$5"
     local bitrate="$6"
+    local deint="$7"
     local video_codec; video_codec=$(detectar_codec_video "$udp_url")
-
     local resize; resize=$(echo "$scale" | sed 's/:/x/')
     local filtro_screen=""
+
     if [[ "$screen" == "1" ]]; then
         filtro_screen='crop=w=ih*16/9:h=ih,scale=1280:720'
     fi
@@ -187,13 +189,13 @@ construir_pipeline_ffmpeg() {
     FF_FILTER=""
     FF_ENCODE=""
 
-    # --- CPU encoder (siempre filtros normales) ---
-    if [[ "$encoder" == "cpu" ]]; then
-        FF_PREINPUT="-y"
-        FF_FILTER="-vf yadif,scale=${scale}"
-        FF_ENCODE="${ENCODER_PRESETS[cpu]}"
+    # --- Pipeline CUDA moderna (si el usuario lo solicita) ---
+    if [[ "$encoder" == "cuda" ]]; then
+        FF_PREINPUT="-y -hwaccel cuda -hwaccel_output_format cuda"
+        FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
+        FF_ENCODE="${ENCODER_PRESETS[cuda]}"
 
-    # --- QSV encoder (Intel) ---
+    # --- Pipeline QSV (Intel) ---
     elif [[ "$encoder" == "qsv" ]]; then
         if [[ "$video_codec" == "mpeg2video" ]]; then
             FF_PREINPUT="-y -hwaccel qsv -c:v mpeg2_qsv"
@@ -221,54 +223,36 @@ construir_pipeline_ffmpeg() {
         fi
         FF_ENCODE="${ENCODER_PRESETS[qsv]}"
 
-    # --- CUDA encoder (usa filtros GPU) ---
-    elif [[ "$encoder" == "cuda" ]]; then
-        FF_PREINPUT="-y -hwaccel cuda -hwaccel_output_format cuda"
-        FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
-        FF_ENCODE="${ENCODER_PRESETS[cuda]}"
-
-    # --- NVENC encoder (Nvidia) ---
+    # --- Pipeline NVENC/cuvid (Nvidia) con lógica correcta ---
     elif [[ "$encoder" == "nvenc" ]]; then
-        # Si es h264, usamos decodificación por GPU y filtros GPU
+        local decoder_flag=""
         if [[ "$video_codec" == "h264" ]]; then
-            FF_PREINPUT="-y -hwaccel cuvid -c:v h264_cuvid"
-            if [[ -n "$filtro_screen" ]]; then
-                FF_FILTER="-vf $filtro_screen"
-            else
-                if [[ "$nodeint" == "0" ]]; then
-                    FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
-                else
-                    FF_FILTER="-vf scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
-                fi
-            fi
-        # Si es MPEG2 o cualquier otro, decodifica por CPU y usa filtros normales
+            decoder_flag="h264_cuvid"
         elif [[ "$video_codec" == "mpeg2video" ]]; then
-            FF_PREINPUT="-y -c:v mpeg2video"
-            if [[ -n "$filtro_screen" ]]; then
-                FF_FILTER="-vf $filtro_screen"
-            else
-                if [[ "$nodeint" == "1" ]]; then
-                    FF_FILTER="-vf scale=${scale}"
-                else
-                    FF_FILTER="-vf yadif,scale=${scale}"
-                fi
-            fi
+            decoder_flag="mpeg2_cuvid"
         else
-            # Para otros codecs, decodifica por CPU y usa filtros normales
-            FF_PREINPUT="-y"
-            if [[ -n "$filtro_screen" ]]; then
-                FF_FILTER="-vf $filtro_screen"
-            else
-                if [[ "$nodeint" == "1" ]]; then
-                    FF_FILTER="-vf scale=${scale}"
-                else
-                    FF_FILTER="-vf yadif,scale=${scale}"
-                fi
-            fi
+            decoder_flag="${video_codec}_cuvid"
         fi
+        local cuvid_flags="-vsync 0 -hwaccel cuvid -c:v $decoder_flag"
+        if [[ "$deint" != "1" ]]; then
+            cuvid_flags="$cuvid_flags -deint 1 -drop_second_field 1"
+        fi
+        cuvid_flags="$cuvid_flags -resize $resize"
+        FF_PREINPUT="-y $cuvid_flags"
+        FF_FILTER="" # NO USAR -vf scale si resize ya está en cuvid
         FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
 
-    # --- Default: decodifica por CPU y usa filtros normales ---
+    # --- Pipeline CPU (si el usuario lo solicita) ---
+    elif [[ "$encoder" == "cpu" ]]; then
+        FF_PREINPUT="-y"
+        if [[ "$nodeint" == "1" ]]; then
+            FF_FILTER="-vf scale=${scale}"
+        else
+            FF_FILTER="-vf yadif,scale=${scale}"
+        fi
+        FF_ENCODE="${ENCODER_PRESETS[cpu]}"
+
+    # --- Fallback: pipeline más simple por defecto ---
     else
         FF_PREINPUT="-y"
         FF_FILTER="-vf scale=${scale}"
@@ -276,30 +260,33 @@ construir_pipeline_ffmpeg() {
     fi
 }
 
-# --- Determina el mapeo de audio (manual o auto), retorna opción para ffmpeg
+# =====================================================================
+# [6] FUNCIONES DE AUDIO, LANZAMIENTO Y SUPERVISIÓN
+# =====================================================================
+
 determinar_mapeo_audio() {
     local udp_url="$1"
     local log_file="$2"
-    local audio="$3"
-    local map="$4"
+    local audio_param="$3"
+    local map_param="$4"
 
-    if [[ -n "$map" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Mapeo manual aplicado: $map" | tee -a "$log_file"
-        echo "$map"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Audio streams detectados (orden y index):" | tee -a "$log_file"
-        local audio_idx
-        if [[ "$audio" == "auto" ]]; then
-            audio_idx=$(detectar_audio_spa_relativo "$udp_url" "$log_file")
-        else
-            audio_idx=$((audio-1))
-        fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Mapeo automático: audio_idx=$audio_idx (usando idioma spa si existe, posición real en contenedor)" | tee -a "$log_file"
-        echo "-map 0:v -map 0:a:$audio_idx"
+    if [[ -n "$map_param" && "$map_param" != "auto" ]]; then
+        echo "$map_param"
+        return
     fi
+
+    if [[ "$audio_param" == "auto" ]]; then
+        local audio_stream
+        audio_stream=$(detectar_audio_spa_relativo "$udp_url" "$log_file")
+        if [[ -n "$audio_stream" ]]; then
+            echo "-map 0:v -map 0:a:$audio_stream"
+            return
+        fi
+    fi
+
+    echo "-map 0:v -map 0:a:0"
 }
 
-# --- Arma el pipeline del canal y lanza ffmpeg en segundo plano, loguea todo
 lanzar_canal() {
     local udp_url="$1"
     local canal_nombre="$2"
@@ -311,10 +298,10 @@ lanzar_canal() {
     udp_url=$(ajustar_url_udp "$udp_url")
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Lanzando canal: $canal_nombre" | tee -a "$log_file"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Parámetros personalizados: nodeint=$nodeint, encoder=$encoder, map='$map', audio=$audio, bitrate=$bitrate, scale=$scale, screen=$screen" | tee -a "$log_file"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Parámetros personalizados: nodeint=$nodeint, encoder=$encoder, map='$map', audio=$audio, bitrate=$bitrate, scale=$scale, screen=$screen, deint=$deint" | tee -a "$log_file"
     limitar_log "$log_file"
 
-    construir_pipeline_ffmpeg "$udp_url" "$encoder" "$nodeint" "$scale" "$screen" "$bitrate"
+    construir_pipeline_ffmpeg "$udp_url" "$encoder" "$nodeint" "$scale" "$screen" "$bitrate" "$deint"
 
     local map_opt
     map_opt="$(determinar_mapeo_audio "$udp_url" "$log_file" "$audio" "$map" | tail -n 1)"
@@ -361,9 +348,6 @@ lanzar_canal() {
     sleep 1
 }
 
-# =====================================================================
-# [5] CARGA DE CANALES DESDE ARCHIVO
-# =====================================================================
 leer_canales() {
     canales=()
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -377,9 +361,6 @@ leer_canales() {
     done < "$CANALES_FILE"
 }
 
-# =====================================================================
-# [6] LANZAMIENTO AUTOMÁTICO DE TODOS LOS CANALES
-# =====================================================================
 lanzar_todos_canales() {
     for entry in "${canales[@]}"; do
         IFS='|' read -r udp_url canal_nombre extra_params <<< "$entry"
@@ -387,9 +368,6 @@ lanzar_todos_canales() {
     done
 }
 
-# =====================================================================
-# [7] SUPERVISIÓN Y RELANZAMIENTO AUTOMÁTICO DE CANALES (PAUSA INDIVIDUAL)
-# =====================================================================
 supervisar_canales() {
     declare -A PAUSA_CANAL
     while true; do
@@ -436,9 +414,6 @@ supervisar_canales() {
     done
 }
 
-# =====================================================================
-# [8] RELANZAMIENTO MANUAL DE CANAL
-# =====================================================================
 relanzar_canal_por_nombre() {
     local nombre="$1"
     leer_canales
@@ -480,7 +455,7 @@ relanzar_canal_por_nombre() {
 }
 
 # =====================================================================
-# [9] ENTRADA PRINCIPAL DEL SCRIPT
+# [7] ENTRADA PRINCIPAL DEL SCRIPT
 # =====================================================================
 if [[ "$1" == "relanzar" && -n "$2" ]]; then
     relanzar_canal_por_nombre "$2"
