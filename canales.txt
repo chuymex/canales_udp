@@ -7,11 +7,12 @@
 #   URL_UDP|NOMBRE_CANAL[|parametros_personalizados]
 #
 # Parámetros personalizados disponibles (puedes combinarlos con coma):
-#   encoder=nvenc      # Nvidia cuvid/nvenc (por defecto si no se especifica)
+#   encoder=nvenc      # Nvidia cuvid/nvenc (por defecto si no se especifica) - usa pipeline cuvid
 #   encoder=cuda       # Decoding y desentrelazado CUDA (yadif_cuda) + NVENC
 #   encoder=qsv        # Intel QSV
 #   encoder=cpu        # Software libx264
 #   nodeint=1          # Canal progresivo, no desentrelazado (solo reescalado)
+#   deint=1            # Deshabilita flags de desentrelazado cuvid (deint y drop_second_field)
 #   audio=1            # Selecciona el primer audio (equivale a: -map 0:v -map 0:a:0)
 #   audio=2            # Selecciona el segundo audio (equivale a: -map 0:v -map 0:a:1)
 #   map=...            # Puedes seguir usando mapeo manual si lo prefieres
@@ -22,5 +23,7 @@
 # udp://@225.1.1.54:5054|mex.hboxtreme.mty|nodeint=1,audio=1
 # udp://@225.1.1.54:5054|mex.hboxtreme.mty|audio=2
 # udp://@225.1.1.54:5054|mex.hboxtreme.mty|encoder=cpu,audio=1
+# udp://@225.1.1.54:5054|mex.hboxtreme.mty|encoder=nvenc,deint=1,audio=1    # nvenc con cuvid sin desentrelazado
+# udp://@225.1.1.54:5054|mex.hboxtreme.mty|encoder=cuda,audio=1             # mantiene pipeline CUDA actual
 #####################################################################################################
 #### 17 CANALES ####
