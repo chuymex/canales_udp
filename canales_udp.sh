@@ -16,8 +16,6 @@
 # =====================================================================
 
 # --- Parámetros por canal, sobreescribibles en canales.txt ---
-# Estos parámetros pueden personalizarse por cada canal en el archivo canales.txt.
-# Si algún parámetro se especifica en la línea del canal, sobreescribirá el valor por defecto.
 declare -A CUSTOM_PARAMS_DEFAULT
 CUSTOM_PARAMS_DEFAULT[nodeint]="0"        # 1 = sin desentrelazado (NO aplica yadif), 0 = con desentrelazado (yadif/deinterlace_qsv/cuvid)
 CUSTOM_PARAMS_DEFAULT[encoder]="nvenc"    # nvenc (Nvidia), qsv (Intel), cpu, cuda
@@ -51,25 +49,23 @@ NC='\033[0m'
 # =====================================================================
 # [1] CONFIGURACIÓN GENERAL Y RUTAS
 # =====================================================================
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"      # Directorio donde está el script
-LOG_DIR="$SCRIPT_DIR/logs"                       # Carpeta de logs por canal
-CANALES_FILE="$SCRIPT_DIR/canales.txt"           # Archivo de canales y parámetros
-RTMP_PREFIX="rtmp://fuentes.playtv.mx:9922/BKR" # Prefijo de salida RTMP
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="$SCRIPT_DIR/logs"
+CANALES_FILE="$SCRIPT_DIR/canales.txt"
+RTMP_PREFIX="rtmp://fuentes.futuretv.pro:9922/tp"
 
 # =====================================================================
 # [2] LOGGING Y INICIALIZACIÓN
 # =====================================================================
-# Inicializa logs y elimina logs antiguos, prepara historial de fallos
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Inicializando logs y eliminando antiguos..."
 mkdir -p "$LOG_DIR"
 find "$LOG_DIR" -type f -name "*.log" -delete
-declare -A FAIL_HISTORY # Historial de timestamps de caídas por canal
+declare -A FAIL_HISTORY
 
 # =====================================================================
 # [3] FUNCIONES MODULARES Y UTILITARIAS
 # =====================================================================
 
-# --- Limita tamaño y líneas de logs para evitar archivos gigantes ---
 limitar_log() {
     local log_file="$1"
     if [[ -f "$log_file" ]]; then
@@ -86,7 +82,6 @@ limitar_log() {
     fi
 }
 
-# --- Detecta el índice de stream de audio en español (spa) en el contenedor, retorna posición relativa ---
 detectar_audio_spa_relativo() {
     local udp_url="$1"
     local log_file="$2"
@@ -115,20 +110,17 @@ detectar_audio_spa_relativo() {
     '
 }
 
-# --- Detecta el codec de video para decidir pipeline óptima (h264, mpeg2video, etc) ---
 detectar_codec_video() {
     local udp_url="$1"
     ffprobe -v error -show_streams -select_streams v "$udp_url" 2>/dev/null | awk -F= '/^codec_name=/{print $2; exit}'
 }
 
-# --- Detecta si ffmpeg soporta filtro scale_qsv (Intel QuickSync) ---
 detectar_soporte_scale_qsv() {
     ffmpeg -hide_banner -filters 2>&1 | grep -q 'scale_qsv'
     return $?
 }
 
-# --- Parsea parámetros personalizados por canal, los exporta como variables locales ---
-# Lee los parámetros extra de la línea del canal y los asigna a variables locales.
+# Devuelve un array asociativo de parámetros personalizados
 parsear_parametros_personalizados() {
     local extra_params="$1"
     declare -A params
@@ -152,11 +144,10 @@ parsear_parametros_personalizados() {
         done
     fi
     for key in "${!params[@]}"; do
-        eval "$key='${params[$key]}'"
+        echo "$key=${params[$key]}"
     done
 }
 
-# --- Agrega fifo_size/overrun_nonfatal si falta en URL UDP para evitar overrun de buffer en ffmpeg ---
 ajustar_url_udp() {
     local url="$1"
     if [[ "$url" =~ ^udp:// ]]; then
@@ -174,9 +165,6 @@ ajustar_url_udp() {
 # =====================================================================
 # [4] PIPELINE FFmpeg ADAPTATIVA (CORRECTA PARA NVENC/cuvid + RESIZE)
 # =====================================================================
-# Construye la pipeline de FFmpeg según el encoder y parámetros personalizados.
-# Para NVENC/cuvid, el resize se hace en el decoder (no se debe poner filtro de escala).
-# Si se especifica nodeint=1 o deint=1, se omite el desentrelazado en cuvid.
 construir_pipeline_ffmpeg() {
     local udp_url="$1"
     local encoder="$2"
@@ -197,13 +185,10 @@ construir_pipeline_ffmpeg() {
     FF_FILTER=""
     FF_ENCODE=""
 
-    # --- Pipeline CUDA moderna ---
     if [[ "$encoder" == "cuda" ]]; then
         FF_PREINPUT="-y -hwaccel cuda -hwaccel_output_format cuda"
         FF_FILTER="-vf yadif_cuda,scale_cuda=w=$(echo "$scale" | cut -d: -f1):h=$(echo "$scale" | cut -d: -f2)"
         FF_ENCODE="${ENCODER_PRESETS[cuda]}"
-
-    # --- Pipeline QSV (Intel QuickSync) ---
     elif [[ "$encoder" == "qsv" ]]; then
         if [[ "$video_codec" == "mpeg2video" ]]; then
             FF_PREINPUT="-y -hwaccel qsv -c:v mpeg2_qsv"
@@ -230,8 +215,6 @@ construir_pipeline_ffmpeg() {
             fi
         fi
         FF_ENCODE="${ENCODER_PRESETS[qsv]}"
-
-    # --- Pipeline NVENC/cuvid (Nvidia) con lógica correcta ---
     elif [[ "$encoder" == "nvenc" ]]; then
         local decoder_flag=""
         if [[ "$video_codec" == "h264" ]]; then
@@ -242,16 +225,13 @@ construir_pipeline_ffmpeg() {
             decoder_flag="${video_codec}_cuvid"
         fi
         local cuvid_flags="-vsync 0 -hwaccel cuvid -c:v $decoder_flag"
-        # --- MODIFICACIÓN: Si deint=1 O nodeint=1, NO añadir desentrelazado ---
         if [[ "$deint" != "1" && "$nodeint" != "1" ]]; then
             cuvid_flags="$cuvid_flags -deint 1 -drop_second_field 1"
         fi
         cuvid_flags="$cuvid_flags -resize $resize"
         FF_PREINPUT="-y $cuvid_flags"
-        FF_FILTER="" # NO USAR -vf scale si resize ya está en cuvid
+        FF_FILTER=""
         FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
-
-    # --- Pipeline CPU ---
     elif [[ "$encoder" == "cpu" ]]; then
         FF_PREINPUT="-y"
         if [[ "$nodeint" == "1" ]]; then
@@ -260,9 +240,12 @@ construir_pipeline_ffmpeg() {
             FF_FILTER="-vf yadif,scale=${scale}"
         fi
         FF_ENCODE="${ENCODER_PRESETS[cpu]}"
-
-    # --- Pipeline fallback por defecto (usa nvenc y solo escala) ---
+    elif [[ -n "$encoder" && -n "${ENCODER_PRESETS[$encoder]}" ]]; then
+        FF_PREINPUT="-y"
+        FF_FILTER="-vf scale=${scale}"
+        FF_ENCODE="${ENCODER_PRESETS[$encoder]}"
     else
+        echo "[WARN] Encoder desconocido '$encoder', usando nvenc por defecto" >> "$log_file"
         FF_PREINPUT="-y"
         FF_FILTER="-vf scale=${scale}"
         FF_ENCODE="${ENCODER_PRESETS[nvenc]}"
@@ -273,7 +256,6 @@ construir_pipeline_ffmpeg() {
 # [5] FUNCIONES DE AUDIO, LANZAMIENTO Y SUPERVISIÓN
 # =====================================================================
 
-# --- Determina el mapeo de audio (manual o auto) ---
 determinar_mapeo_audio() {
     local udp_url="$1"
     local log_file="$2"
@@ -297,7 +279,6 @@ determinar_mapeo_audio() {
     echo "-map 0:v -map 0:a:0"
 }
 
-# --- Lanza el canal usando los parámetros personalizados, prepara logging y comando ---
 lanzar_canal() {
     local udp_url="$1"
     local canal_nombre="$2"
@@ -305,7 +286,21 @@ lanzar_canal() {
     local rtmp_url="$RTMP_PREFIX/$canal_nombre"
     local log_file="$LOG_DIR/$canal_nombre.log"
 
-    parsear_parametros_personalizados "$extra_params"
+    # --- Usar parámetros locales (no globales) para evitar contaminación entre canales ---
+    declare -A param_map
+    while IFS='=' read -r key value; do
+        param_map["$key"]="$value"
+    done < <(parsear_parametros_personalizados "$extra_params")
+
+    local nodeint="${param_map[nodeint]}"
+    local encoder="${param_map[encoder]}"
+    local map="${param_map[map]}"
+    local audio="${param_map[audio]}"
+    local bitrate="${param_map[bitrate]}"
+    local scale="${param_map[scale]}"
+    local screen="${param_map[screen]}"
+    local deint="${param_map[deint]}"
+
     udp_url=$(ajustar_url_udp "$udp_url")
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Lanzando canal: $canal_nombre" | tee -a "$log_file"
@@ -363,7 +358,6 @@ lanzar_canal() {
     sleep 1
 }
 
-# --- Lee los canales definidos en el archivo canales.txt ---
 leer_canales() {
     canales=()
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -377,7 +371,6 @@ leer_canales() {
     done < "$CANALES_FILE"
 }
 
-# --- Lanza todos los canales en paralelo según el archivo canales.txt ---
 lanzar_todos_canales() {
     for entry in "${canales[@]}"; do
         IFS='|' read -r udp_url canal_nombre extra_params <<< "$entry"
@@ -385,9 +378,8 @@ lanzar_todos_canales() {
     done
 }
 
-# --- Supervisor automático: relanza canales caídos, pausa individual si excede fallas ---
 supervisar_canales() {
-    declare -A PAUSA_CANAL # Mapa canal -> timestamp (hasta cuándo está pausado)
+    declare -A PAUSA_CANAL
     while true; do
         now=$(date +%s)
         for entry in "${canales[@]}"; do
@@ -395,14 +387,12 @@ supervisar_canales() {
             rtmp_url="$RTMP_PREFIX/$canal_nombre"
             log_file="$LOG_DIR/$canal_nombre.log"
 
-            # Si el canal está en pausa, lo saltamos hasta que termine la pausa
             if [[ -n "${PAUSA_CANAL["$canal_nombre"]}" ]] && (( now < PAUSA_CANAL["$canal_nombre"] )); then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Supervisor: el canal $canal_nombre está en pausa hasta $(date -d @${PAUSA_CANAL["$canal_nombre"]})" >> "$log_file"
                 limitar_log "$log_file"
                 continue
             fi
 
-            # Detectar proceso ffmpeg activo para el canal
             local pids
             pids=$(ps -eo pid,args | grep "[f]fmpeg" | awk -v url="$rtmp_url" '
             {
@@ -419,7 +409,7 @@ supervisar_canales() {
                 if (( fails > MAX_FAILS )); then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] Canal $canal_nombre cayó $fails veces en los últimos $FAIL_WINDOW segundos. Pausando relanzamiento por 10 minutos." >> "$log_file"
                     limitar_log "$log_file"
-                    PAUSA_CANAL["$canal_nombre"]=$((now+600))  # Pausa solo este canal
+                    PAUSA_CANAL["$canal_nombre"]=$((now+600))
                     continue
                 fi
 
@@ -434,7 +424,6 @@ supervisar_canales() {
     done
 }
 
-# --- Relanzamiento manual de canal por nombre desde terminal ---
 relanzar_canal_por_nombre() {
     local nombre="$1"
     leer_canales
@@ -462,7 +451,34 @@ relanzar_canal_por_nombre() {
                 done
                 sleep 1
             fi
-            lanzar_canal "$udp_url" "$canal_nombre" "$extra_params"
+            # --- Usar el patrón seguro de parámetros locales ---
+            declare -A param_map
+            while IFS='=' read -r key value; do
+                param_map["$key"]="$value"
+            done < <(parsear_parametros_personalizados "$extra_params")
+
+            local nodeint="${param_map[nodeint]}"
+            local encoder="${param_map[encoder]}"
+            local map="${param_map[map]}"
+            local audio="${param_map[audio]}"
+            local bitrate="${param_map[bitrate]}"
+            local scale="${param_map[scale]}"
+            local screen="${param_map[screen]}"
+            local deint="${param_map[deint]}"
+
+            udp_url=$(ajustar_url_udp "$udp_url")
+
+            construir_pipeline_ffmpeg "$udp_url" "$encoder" "$nodeint" "$scale" "$screen" "$bitrate" "$deint"
+
+            local map_opt
+            map_opt="$(determinar_mapeo_audio "$udp_url" "$log_file" "$audio" "$map" | tail -n 1)"
+            limitar_log "$log_file"
+
+            local ffmpeg_cmd="ffmpeg $FF_PREINPUT -i $udp_url $FF_FILTER $FF_ENCODE $map_opt $rtmp_url"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Comando FFmpeg generado: $ffmpeg_cmd" | tee -a "$log_file"
+            limitar_log "$log_file"
+
+            nohup $ffmpeg_cmd >> "$log_file" 2>&1 &
             echo -e "${GREEN}Canal ${YELLOW}$canal_nombre${GREEN} relanzado manualmente.${NC}"
             echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Canal $canal_nombre relanzado manualmente." >> "$log_file"
             limitar_log "$log_file"
@@ -478,7 +494,6 @@ relanzar_canal_por_nombre() {
 # =====================================================================
 # [6] ENTRADA PRINCIPAL DEL SCRIPT
 # =====================================================================
-# Uso: ./canales_udp.sh [relanzar canal]
 if [[ "$1" == "relanzar" && -n "$2" ]]; then
     relanzar_canal_por_nombre "$2"
     exit $?
