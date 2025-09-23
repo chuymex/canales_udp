@@ -52,7 +52,7 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 CANALES_FILE="$SCRIPT_DIR/canales.txt"
-RTMP_PREFIX="rtmp://fuentes.futuretv.pro:9922/tp"
+RTMP_PREFIX="rtmp://fuentes.playtv.mx:9922/BKR"
 
 # =====================================================================
 # [2] LOGGING Y INICIALIZACIÓN
